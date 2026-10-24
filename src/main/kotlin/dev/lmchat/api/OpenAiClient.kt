@@ -35,12 +35,41 @@ class OpenAiClient(baseUrl: String, private val apiKey: String) {
         return if (path.isNullOrEmpty()) "$t/v1" else t
     }
 
-    private fun request(path: String): HttpRequest.Builder {
-        val b = HttpRequest.newBuilder(URI.create("$root$path"))
+    private fun builder(url: String): HttpRequest.Builder {
+        val b = HttpRequest.newBuilder(URI.create(url))
         if (apiKey.isNotBlank()) b.header("Authorization", "Bearer $apiKey")
         return b
     }
 
+    private fun request(path: String) = builder("$root$path")
+
+    private fun post(path: String, body: JsonObject) = postUrl("$root$path", body)
+
+    private fun postUrl(url: String, body: JsonObject): JsonObject {
+        val req = builder(url)
+            .timeout(Duration.ofSeconds(60))
+            .header("Content-Type", "application/json")
+            .POST(HttpRequest.BodyPublishers.ofString(body.toString()))
+            .build()
+        val resp = http.send(req, HttpResponse.BodyHandlers.ofString())
+        check(resp.statusCode() in 200..299) { "HTTP ${resp.statusCode()}: ${resp.body().take(300)}" }
+        return JsonParser.parseString(resp.body()).asJsonObject
+    }
+
+    /** Ollama native fill-in-the-middle: the server applies the model's own infill template. */
+    fun ollamaFim(model: String, prefix: String, suffix: String, maxTokens: Int): String {
+        val options = JsonObject()
+        options.addProperty("temperature", 0.0)
+        options.addProperty("num_predict", maxTokens)
+        val body = JsonObject()
+        body.addProperty("model", model)
+        body.addProperty("prompt", prefix)
+        body.addProperty("suffix", suffix)
+        body.addProperty("stream", false)
+        body.addProperty("keep_alive", "30m")
+        body.add("options", options)
+        return postUrl("${root.removeSuffix("/v1")}/api/generate", body).str("response") ?: ""
+    }
     fun listModels(filter: String = ""): List<String> {
         val terms = filter.split(',').map { it.trim() }.filter { it.isNotEmpty() }
         val resp = http.send(
@@ -175,16 +204,5 @@ class OpenAiClient(baseUrl: String, private val apiKey: String) {
             body.add("stop", s)
         }
         return post("/completions", body).getAsJsonArray("choices")?.firstOrNull()?.asJsonObject?.str("text") ?: ""
-    }
-
-    private fun post(path: String, body: JsonObject): JsonObject {
-        val req = request(path)
-            .timeout(Duration.ofSeconds(60))
-            .header("Content-Type", "application/json")
-            .POST(HttpRequest.BodyPublishers.ofString(body.toString()))
-            .build()
-        val resp = http.send(req, HttpResponse.BodyHandlers.ofString())
-        check(resp.statusCode() in 200..299) { "HTTP ${resp.statusCode()}: ${resp.body().take(300)}" }
-        return JsonParser.parseString(resp.body()).asJsonObject
     }
 }

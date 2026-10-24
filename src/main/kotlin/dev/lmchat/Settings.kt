@@ -51,6 +51,7 @@ class Preset(val name: String, val url: String, val filter: String)
 
 val PRESETS = listOf(
     Preset("LM Studio (LAN)", "http://192.168.0.101:1234/v1", ""),
+    Preset("Ollama (local)", "http://localhost:11434/v1", ""),
     Preset("OpenRouter (free models)", "https://openrouter.ai/api/v1", ":free"),
     Preset("OpenCode Zen (free models)", "https://opencode.ai/zen/v1", "free,big-pickle"),
     Preset("Custom (OpenAI-compatible)", "https://", "")
@@ -113,8 +114,14 @@ class LmConfigurable : Configurable {
     private val compEnabled = JBCheckBox("Enable inline code completion (Tab accepts)")
     private val compProvider = ComboBox<Ref>()
     private val compModel = ComboBox<String>().apply { isEditable = true }
-    private val compMode =
-        ComboBox<String>(arrayOf("Chat (works with any model)", "FIM (code models, /v1/completions)"))
+    private val modes = listOf("chat", "fim", "ollama")
+    private val compMode = ComboBox<String>(
+        arrayOf(
+            "Chat (works with any model)",
+            "FIM (/v1/completions, pick a template)",
+            "Ollama FIM (/api/generate, model's own template)"
+        )
+    )
     private val fimBox = ComboBox<String>(FimTemplate.values().map { it.label }.toTypedArray())
     private val ctxBefore = JBIntSpinner(60, 0, 500)
     private val ctxAfter = JBIntSpinner(20, 0, 200)
@@ -258,7 +265,7 @@ class LmConfigurable : Configurable {
         s.completionEnabled = compEnabled.isSelected
         s.completionProviderId = compProviderId()
         s.completionModel = compModelText()
-        s.completionMode = if (compMode.selectedIndex == 1) "fim" else "chat"
+        s.completionMode = modes[compMode.selectedIndex.coerceAtLeast(0)]
         s.fimTemplate = FimTemplate.values()[fimBox.selectedIndex.coerceAtLeast(0)].name
         s.ctxLinesBefore = ctxBefore.number
         s.ctxLinesAfter = ctxAfter.number
@@ -279,7 +286,7 @@ class LmConfigurable : Configurable {
         compEnabled.isSelected = s.completionEnabled
         refreshProviders(s.completionProviderId)
         compModel.selectedItem = s.completionModel
-        compMode.selectedIndex = if (s.completionMode == "fim") 1 else 0
+        compMode.selectedIndex = modes.indexOf(s.completionMode).coerceAtLeast(0)
         fimBox.selectedIndex = FimTemplate.of(s.fimTemplate).ordinal
         ctxBefore.number = s.ctxLinesBefore
         ctxAfter.number = s.ctxLinesAfter

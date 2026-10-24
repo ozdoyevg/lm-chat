@@ -2,6 +2,7 @@ package dev.lmchat.ui
 
 import com.google.gson.JsonArray
 import com.google.gson.JsonObject
+import com.google.gson.JsonParser
 import com.intellij.icons.AllIcons
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.actionSystem.ActionManager
@@ -114,9 +115,7 @@ class ChatPanel(project: Project) : JPanel(BorderLayout()), Disposable {
     private val history = mutableListOf<JsonObject>()
 
     private val modelBox = ComboBox<ModelItem>()
-    private val transcript = JBTextArea().apply {
-        isEditable = false; lineWrap = true; wrapStyleWord = true; margin = JBUI.insets(6)
-    }
+    private val view = ChatView()
     private val input = JBTextArea(3, 20).apply { lineWrap = true; wrapStyleWord = true }
 
     private val sendBtn = JButton(IconLoader.getIcon("/icons/send.svg", ChatPanel::class.java)).apply {
@@ -163,7 +162,7 @@ class ChatPanel(project: Project) : JPanel(BorderLayout()), Disposable {
             add(toolbar.component, BorderLayout.EAST)
         }, BorderLayout.NORTH)
 
-        add(JBScrollPane(transcript), BorderLayout.CENTER)
+        add(view, BorderLayout.CENTER)
 
         add(JPanel(BorderLayout(4, 0)).apply {
             border = JBUI.Borders.empty(4)
@@ -199,15 +198,6 @@ class ChatPanel(project: Project) : JPanel(BorderLayout()), Disposable {
     private fun ui(r: () -> Unit) =
         ApplicationManager.getApplication().invokeLater({ r() }, ModalityState.any())
 
-    /** Leading newlines are dropped while the transcript is empty, so there are no blank rows at the top. */
-    private fun append(s: String) = ui {
-        val t = if (transcript.document.length == 0) s.trimStart('\n') else s
-        if (t.isNotEmpty()) {
-            transcript.append(t)
-            transcript.caretPosition = transcript.document.length
-        }
-    }
-
     private fun setBusy(b: Boolean) {
         busy = b
         (actionHolder.layout as CardLayout).show(actionHolder, if (b) "stop" else "send")
@@ -215,7 +205,7 @@ class ChatPanel(project: Project) : JPanel(BorderLayout()), Disposable {
 
     private fun clearChat() {
         if (!busy) {
-            history.clear(); transcript.text = ""
+            history.clear(); view.clear()
         }
     }
 
@@ -244,10 +234,10 @@ class ChatPanel(project: Project) : JPanel(BorderLayout()), Disposable {
                         items.forEach { modelBox.addItem(it) }
                         items.firstOrNull { it.key == last }?.let { modelBox.selectedItem = it }
                         loadingModels = false
-                        if (items.isEmpty()) append("\n[info] ${p.name}: no models matched.\n")
+                        if (items.isEmpty()) view.info("${p.name}: no models matched.")
                     }
                 } catch (e: Exception) {
-                    append("\n[error] ${p.name}: ${e.message ?: e}\n")
+                    ui { view.error("${p.name}: ${e.message ?: e}") }
                 }
             }
         }
@@ -261,7 +251,7 @@ class ChatPanel(project: Project) : JPanel(BorderLayout()), Disposable {
         if (text.isEmpty()) return
         val item = modelBox.selectedItem as? ModelItem
         if (item == null) {
-            append("\n[error] No model selected. Check Settings and press reload.\n"); return
+            view.error("No model selected. Check Settings and reload."); return
         }
         input.text = ""
         startTurn(text, item)
@@ -271,7 +261,7 @@ class ChatPanel(project: Project) : JPanel(BorderLayout()), Disposable {
         val s = settings
         val provider = s.providers.firstOrNull { it.id == item.providerId }
         if (provider == null) {
-            append("\n[error] That provider was removed. Reload models.\n"); return
+            view.error("That provider was removed. Reload models."); return
         }
         val url = provider.baseUrl
         val providerId = provider.id
@@ -282,7 +272,8 @@ class ChatPanel(project: Project) : JPanel(BorderLayout()), Disposable {
         stopRequested = false
         setBusy(true)
         history.add(message("user", userText))
-        append("\n\nYou: $userText\n\nAssistant: ")
+        view.userMessage(userText)
+        view.beginAssistant()
 
         ApplicationManager.getApplication().executeOnPooledThread {
             try {
@@ -290,27 +281,22 @@ class ChatPanel(project: Project) : JPanel(BorderLayout()), Disposable {
                 client = c
                 agentLoop(c, item.model, system, temperature, useTools)
             } catch (e: Exception) {
-                append("\n[error] ${e.message ?: e}\n")
+                ui { view.error(e.message ?: e.toString()) }
             } finally {
-                ui { setBusy(false) }
+                ui { view.endAssistant(); setBusy(false) }
             }
         }
     }
 
     private fun agentLoop(c: OpenAiClient, model: String, system: String, temperature: Double, useTools: Boolean) {
         val listener = object : StreamListener {
-            private var thinking = false
-            override fun onText(chunk: String) = append(chunk)
-            override fun onReasoning(chunk: String) {
-                if (!thinking) {
-                    thinking = true; append("(thinking…) ")
-                }
-            }
+            override fun onText(chunk: String) = ui { view.assistantText(chunk) }
+            override fun onReasoning(chunk: String) = ui { view.thinking() }
         }
 
         for (round in 1..MAX_ROUNDS) {
             if (stopRequested) {
-                append("\n[stopped]\n"); return
+                ui { view.info("Stopped.") }; return
             }
 
             val messages = ArrayList<JsonObject>()
@@ -320,7 +306,7 @@ class ChatPanel(project: Project) : JPanel(BorderLayout()), Disposable {
             val res = c.streamChat(model, messages, if (useTools) tools.specs else null, temperature, listener)
             if (res.cancelled) {
                 if (res.text.isNotEmpty()) history.add(message("assistant", res.text))
-                append("\n[stopped]\n")
+                ui { view.info("Stopped.") }
                 return
             }
 
@@ -339,17 +325,29 @@ class ChatPanel(project: Project) : JPanel(BorderLayout()), Disposable {
             if (res.toolCalls.isEmpty()) return
 
             for (tc in res.toolCalls) {
-                append("\n⚙ ${tc.name}(${tc.arguments.take(160)})\n")
-                history.add(toolMessage(tc.id, tools.execute(tc.name, tc.arguments)))
+                ui { view.toolCall(tc.name, formatArgs(tc.arguments)) }
+                val out = tools.execute(tc.name, tc.arguments)
+                history.add(toolMessage(tc.id, out))
+                val failed = out.startsWith("Error") || out.startsWith("The user denied")
+                val summary = if (out.length <= 120) out.replace('\n', ' ') else "${out.length} chars returned"
+                ui { view.toolResult(summary, failed) }
             }
-            append("\nAssistant: ")
         }
-        append("\n[stopped: too many tool rounds]\n")
+        ui { view.info("Stopped: too many tool rounds.") }
     }
 
     override fun dispose() {
         client?.cancel()
     }
+}
+
+private fun formatArgs(json: String): String = try {
+    JsonParser.parseString(json).asJsonObject.entrySet().joinToString("  ") { (k, v) ->
+        val s = (if (v.isJsonPrimitive) v.asString else v.toString()).replace('\n', ' ')
+        "$k=" + if (s.length > 60) s.take(60) + "…" else s
+    }
+} catch (e: Exception) {
+    json.take(120)
 }
 
 private fun message(role: String, content: String) =

@@ -220,7 +220,7 @@ class CompletionService : Disposable {
         val url = provider.baseUrl
         val providerId = provider.id
         val model = s.completionModel
-        val fim = s.completionMode == "fim"
+        val mode = s.completionMode
         val template = FimTemplate.of(s.fimTemplate)
         val maxLines = s.maxSuggestLines
         val maxTokens = s.completionMaxTokens
@@ -228,10 +228,10 @@ class CompletionService : Disposable {
         ApplicationManager.getApplication().executeOnPooledThread {
             val text = try {
                 val client = OpenAiClient(url, LmSettings.apiKey(providerId))
-                val raw = if (fim) {
-                    client.completeOnce(model, template.prompt(prefix, suffix), 0.0, maxTokens, template.stop)
-                } else {
-                    client.chatOnce(model, chatMessages(fileName, prefix, suffix, maxLines), 0.0, maxTokens)
+                val raw = when (mode) {
+                    "ollama" -> client.ollamaFim(model, prefix, suffix, maxTokens)
+                    "fim" -> client.completeOnce(model, template.prompt(prefix, suffix), 0.0, maxTokens, template.stop)
+                    else -> client.chatOnce(model, chatMessages(fileName, prefix, suffix, maxLines), 0.0, maxTokens)
                 }
                 clean(raw, prefix, maxLines)
             } catch (e: Exception) {
