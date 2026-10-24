@@ -146,4 +146,45 @@ class OpenAiClient(baseUrl: String, private val apiKey: String) {
             .connectTimeout(Duration.ofSeconds(10))
             .build()
     }
+
+    /** Non-streaming chat completion; returns the assistant text. */
+    fun chatOnce(model: String, messages: List<JsonObject>, temperature: Double, maxTokens: Int): String {
+        val body = JsonObject()
+        body.addProperty("model", model)
+        body.addProperty("stream", false)
+        body.addProperty("temperature", temperature)
+        body.addProperty("max_tokens", maxTokens)
+        val arr = JsonArray()
+        messages.forEach { arr.add(it) }
+        body.add("messages", arr)
+        return post("/chat/completions", body).getAsJsonArray("choices")?.firstOrNull()?.asJsonObject
+            ?.getAsJsonObject("message")?.str("content") ?: ""
+    }
+
+    /** Raw text completion, used for fill-in-the-middle. */
+    fun completeOnce(model: String, prompt: String, temperature: Double, maxTokens: Int, stop: List<String>): String {
+        val body = JsonObject()
+        body.addProperty("model", model)
+        body.addProperty("prompt", prompt)
+        body.addProperty("stream", false)
+        body.addProperty("temperature", temperature)
+        body.addProperty("max_tokens", maxTokens)
+        if (stop.isNotEmpty()) {
+            val s = JsonArray()
+            stop.forEach { s.add(it) }
+            body.add("stop", s)
+        }
+        return post("/completions", body).getAsJsonArray("choices")?.firstOrNull()?.asJsonObject?.str("text") ?: ""
+    }
+
+    private fun post(path: String, body: JsonObject): JsonObject {
+        val req = request(path)
+            .timeout(Duration.ofSeconds(60))
+            .header("Content-Type", "application/json")
+            .POST(HttpRequest.BodyPublishers.ofString(body.toString()))
+            .build()
+        val resp = http.send(req, HttpResponse.BodyHandlers.ofString())
+        check(resp.statusCode() in 200..299) { "HTTP ${resp.statusCode()}: ${resp.body().take(300)}" }
+        return JsonParser.parseString(resp.body()).asJsonObject
+    }
 }
