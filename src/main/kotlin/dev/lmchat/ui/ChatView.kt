@@ -22,6 +22,16 @@ import javax.swing.text.StyleConstants
 import javax.swing.text.StyledDocument
 import javax.swing.text.StyledEditorKit
 import javax.swing.text.ViewFactory
+import java.awt.Font
+import java.awt.Graphics2D
+import javax.swing.event.DocumentEvent
+import javax.swing.event.DocumentListener
+import com.google.gson.JsonParser
+import dev.lmchat.api.str
+import java.awt.Cursor
+import java.awt.event.MouseAdapter
+import java.awt.event.MouseEvent
+import java.awt.event.MouseMotionAdapter
 
 // ---------------------------------------------------------------------------------------------
 // Paragraph backgrounds: Swing only paints backgrounds behind characters, so we paint full-width
@@ -29,6 +39,7 @@ import javax.swing.text.ViewFactory
 // ---------------------------------------------------------------------------------------------
 
 private val BG_KEY = Any()
+private val CODE_KEYS = setOf("content", "old_text", "new_text")
 
 private class BlockParagraphView(elem: Element) : ParagraphView(elem) {
     override fun paint(g: Graphics, a: Shape) {
@@ -51,6 +62,40 @@ private class BlockEditorKit : StyledEditorKit() {
     }
 }
 
+/** Text pane that draws a centered hint while it has no content. */
+private class ChatPane : JTextPane() {
+    override fun paintComponent(g: Graphics) {
+        super.paintComponent(g)
+        if (document.length != 0) return
+        val g2 = g.create() as Graphics2D
+        try {
+            UIUtil.applyRenderingHints(g2)
+            val base = UIUtil.getLabelFont()
+            val titleFont = base.deriveFont(Font.BOLD, base.size2D + 2f)
+            val titleFm = g2.getFontMetrics(titleFont)
+            val bodyFm = g2.getFontMetrics(base)
+            val title = "Chat is empty"
+            val lines = listOf("Pick a model above and write a message.", "Enter to send · Shift+Enter for a new line")
+            val gap = JBUI.scale(6)
+            val total = titleFm.height + gap + bodyFm.height * lines.size
+            var y = (height - total) / 2 + titleFm.ascent
+
+            g2.font = titleFont
+            g2.color = Palette.muted
+            g2.drawString(title, (width - titleFm.stringWidth(title)) / 2, y)
+
+            y += titleFm.descent + gap + bodyFm.ascent
+            g2.font = base
+            for (line in lines) {
+                g2.drawString(line, (width - bodyFm.stringWidth(line)) / 2, y)
+                y += bodyFm.height
+            }
+        } finally {
+            g2.dispose()
+        }
+    }
+}
+
 private object Palette {
     val userHead = JBColor(Color(0x1F6FEB), Color(0x58A6FF))
     val userBg = JBColor(Color(0xEAF2FF), Color(0x26303F))
@@ -64,6 +109,8 @@ private object Palette {
     val inlineBg = JBColor(Color(0xE7E9EC), Color(0x373B40))
     val muted = JBColor(Color(0x6B7280), Color(0x8B949E))
     val error = JBColor(Color(0xCF222E), Color(0xF85149))
+    val diffOldBg = JBColor(Color(0xFFEBE9), Color(0x3D2326))
+    val diffNewBg = JBColor(Color(0xE6FFEC), Color(0x1F3326))
 }
 
 private fun schemeColor(key: TextAttributesKey, fallback: Color): Color =
@@ -149,7 +196,7 @@ class CodeHighlighter(lang: String) {
 // ---------------------------------------------------------------------------------------------
 
 class ChatView private constructor(private val pane: JTextPane) : JBScrollPane(pane) {
-    constructor() : this(JTextPane())
+    constructor() : this(ChatPane())
 
     private enum class Mode { NONE, TEXT, CODE }
 
@@ -210,6 +257,12 @@ class ChatView private constructor(private val pane: JTextPane) : JBScrollPane(p
     private val aError = chars(Palette.error)
     private val aCodeLabel = chars(Palette.codeLabel, mono = true, size = monoSize - 2)
     private val tiny = chars(JBColor.foreground(), size = 4)
+    private val aFoldGlyph = chars(Palette.toolHead, bold = true, mono = true)
+    private val aAsk = chars(Palette.toolHead)
+    private val aAllow = chars(Palette.botHead, bold = true).also { StyleConstants.setUnderline(it, true) }
+    private val aDeny = chars(Palette.error, bold = true).also { StyleConstants.setUnderline(it, true) }
+    private val aAllowDone = chars(Palette.botHead, bold = true)
+    private val aDenyDone = chars(Palette.error, bold = true)
 
     private val aCode: Map<Kind, SimpleAttributeSet> = mapOf(
         Kind.PLAIN to chars(
@@ -267,14 +320,54 @@ class ChatView private constructor(private val pane: JTextPane) : JBScrollPane(p
     private var bold = false
     private var pendingStar = false
     private var thinkingShown = false
+    
+    private class Region(var start: Int, var end: Int, val onClick: () -> Unit)
+
+    private class Fold(
+        val lines: List<String>, val lang: String,
+        val head: SimpleAttributeSet, val body: SimpleAttributeSet
+    ) {
+        lateinit var region: Region
+        var bodyStart = 0
+        var bodyLen = 0
+        var expanded = true
+    }
+
+    private val regions = mutableListOf<Region>()     // clickable ranges (fold headers, Allow/Deny)
+    private val folds = mutableListOf<Fold>()
+    private var pending: ((Boolean) -> Unit)? = null  // approval waiting for a click
 
     init {
         pane.editorKit = BlockEditorKit()
+        doc.addDocumentListener(object : DocumentListener {
+            override fun insertUpdate(e: DocumentEvent) {
+                if (e.document.length == e.length) pane.repaint()
+            }
+
+            override fun removeUpdate(e: DocumentEvent) {
+                if (e.document.length == 0) pane.repaint()
+            }
+
+            override fun changedUpdate(e: DocumentEvent) {}
+        })
         pane.isEditable = false
         pane.background = UIUtil.getEditorPaneBackground()
         pane.border = JBUI.Borders.empty(6, 4)
         (pane.caret as? DefaultCaret)?.updatePolicy = DefaultCaret.NEVER_UPDATE
         border = JBUI.Borders.empty()
+
+        pane.addMouseListener(object : MouseAdapter() {
+            override fun mouseClicked(e: MouseEvent) {
+                if (SwingUtilities.isLeftMouseButton(e)) regionAt(e)?.onClick?.invoke()
+            }
+        })
+        pane.addMouseMotionListener(object : MouseMotionAdapter() {
+            override fun mouseMoved(e: MouseEvent) {
+                pane.cursor = Cursor.getPredefinedCursor(
+                    if (regionAt(e) != null) Cursor.HAND_CURSOR else Cursor.TEXT_CURSOR
+                )
+            }
+        })
     }
 
     private val doc: StyledDocument get() = pane.styledDocument
@@ -310,16 +403,164 @@ class ChatView private constructor(private val pane: JTextPane) : JBScrollPane(p
         emit("thinking…\n", aMuted, pNormal)
     }
 
-    fun toolCall(name: String, args: String) {
+    fun toolCall(name: String, argsJson: String) {
         endStream(); ensureNewline()
         pad(pTool)
+
+        val obj = try {
+            JsonParser.parseString(argsJson).asJsonObject
+        } catch (e: Exception) {
+            null
+        }
+        val simple = StringBuilder()
+        val codeArgs = ArrayList<Pair<String, String>>()
+        obj?.entrySet()?.forEach { (k, v) ->
+            val s = if (v.isJsonPrimitive) v.asString else v.toString()
+            if (k in CODE_KEYS || s.contains('\n') || s.length > 120) codeArgs.add(k to s)
+            else simple.append("  ").append(k).append('=').append(s)
+        }
+        if (obj == null && argsJson.isNotBlank()) simple.append("  ").append(argsJson.take(200))
+
         emit("⚙ ", aToolIcon, pTool)
         emit(name, aToolName, pTool)
-        if (args.isNotEmpty()) emit("  $args", aToolArgs, pTool)
+        if (simple.isNotEmpty()) emit(simple.toString(), aToolArgs, pTool)
         emit("\n", aToolArgs, pTool)
+
+        val lang = langFromPath(obj?.str("path"))
+        for ((label, text) in codeArgs) {
+            val bg = when (label) {
+                "old_text" -> Palette.diffOldBg
+                "new_text" -> Palette.diffNewBg
+                else -> Palette.codeBg
+            }
+            foldSection(label, text, lang, bg)
+        }
         scrollToBottom()
     }
 
+    // ---- foldable code sections ----
+
+    private fun foldSection(label: String, text: String, lang: String, bg: Color) {
+        val lines = text.replace("\r", "").replace("\t", "    ").split("\n").let {
+            if (it.size > 1 && it.last().isEmpty()) it.dropLast(1) else it
+        }
+        val f = Fold(lines, lang, para(bg, 14f, 10f, 3f, 1f), para(bg, 14f, 10f))
+        val count = "${lines.size} line${if (lines.size == 1) "" else "s"}"
+        val title = " $label · $count" + if (lang.isNotEmpty()) " · $lang" else ""
+
+        val hs = doc.length
+        emit("▾", aFoldGlyph, f.head)
+        emit(title, aCodeLabel, f.head)
+        f.region = Region(hs, doc.length) { toggle(f) }
+        emit("\n", aCodeLabel, f.head)
+
+        f.bodyStart = doc.length
+        f.bodyLen = writeBody(f, f.bodyStart) - f.bodyStart
+        regions.add(f.region)
+        folds.add(f)
+    }
+
+    private fun writeBody(f: Fold, at: Int): Int {
+        var pos = at
+        val h = CodeHighlighter(f.lang)
+        for (line in f.lines) {
+            for ((t, kind) in h.line(line)) pos = emit(t, aCode.getValue(kind), f.body, pos)
+            pos = emit("\n", aCode.getValue(Kind.PLAIN), f.body, pos)
+        }
+        return pos
+    }
+
+    private fun toggle(f: Fold) {
+        if (f.expanded) {
+            doc.remove(f.bodyStart, f.bodyLen)
+            shift(f.bodyStart + f.bodyLen, -f.bodyLen, skip = f)
+            f.bodyLen = 0
+            f.expanded = false
+        } else {
+            val len = writeBody(f, f.bodyStart) - f.bodyStart
+            shift(f.bodyStart, len, skip = f)
+            f.bodyLen = len
+            f.expanded = true
+        }
+        (doc as AbstractDocument).replace(f.region.start, 1, if (f.expanded) "▾" else "▸", aFoldGlyph)
+        doc.setParagraphAttributes(f.region.start, 1, f.head, true)
+    }
+
+    /** After text was inserted/removed in the middle, move everything that sits at or after [from]. */
+    private fun shift(from: Int, delta: Int, skip: Fold? = null) {
+        for (r in regions) if (r.start >= from) {
+            r.start += delta; r.end += delta
+        }
+        for (f in folds) if (f !== skip && f.bodyStart >= from) f.bodyStart += delta
+    }
+
+    private fun regionAt(e: MouseEvent): Region? {
+        val off = pane.viewToModel2D(e.point)
+        val r = regions.firstOrNull { off >= it.start && off <= it.end } ?: return null
+        val rect = try {
+            pane.modelToView2D(off)
+        } catch (ex: Exception) {
+            null
+        } ?: return null
+        return if (e.y >= rect.y && e.y <= rect.y + rect.height) r else null
+    }
+
+    private fun langFromPath(path: String?): String {
+        val ext = path?.substringAfterLast('.', "")?.lowercase().orEmpty()
+        return when (ext) {
+            "php", "phtml", "inc" -> "php"
+            "js", "mjs", "jsx" -> "js"
+            "ts", "tsx" -> "ts"
+            "py" -> "py"
+            "kt", "kts" -> "kt"
+            "sh", "bash" -> "sh"
+            "yml", "yaml" -> "yaml"
+            else -> ext
+        }
+    }
+
+    // ---- inline approval ----
+
+    fun requestApproval(prompt: String, onDecision: (Boolean) -> Unit) {
+        endStream(); ensureNewline()
+        val ls = doc.length
+        emit("$prompt?  ", aAsk, pTool)
+        val a0 = doc.length
+        emit("[ Allow ]", aAllow, pTool)
+        val a1 = doc.length
+        emit("   ", aAsk, pTool)
+        val d0 = doc.length
+        emit("[ Deny ]", aDeny, pTool)
+        val d1 = doc.length
+        emit("\n", aAsk, pTool)
+
+        var done = false
+        lateinit var allowR: Region
+        lateinit var denyR: Region
+        fun decide(ok: Boolean) {
+            if (done) return
+            done = true
+            pending = null
+            regions.remove(allowR); regions.remove(denyR)
+            val oldLen = d1 - ls
+            val text = if (ok) "✓ Allowed: $prompt" else "✗ Denied: $prompt"
+            (doc as AbstractDocument).replace(ls, oldLen, text, if (ok) aAllowDone else aDenyDone)
+            doc.setParagraphAttributes(ls, text.length, pTool, true)
+            shift(ls + oldLen, text.length - oldLen)
+            onDecision(ok)
+        }
+        allowR = Region(a0, a1) { decide(true) }
+        denyR = Region(d0, d1) { decide(false) }
+        regions.add(allowR); regions.add(denyR)
+        pending = { ok -> decide(ok) }
+        scrollToBottom()
+    }
+
+    /** Called when the user presses Stop or the panel closes while a change is awaiting approval. */
+    fun denyPending() {
+        pending?.invoke(false)
+    }
+    
     fun toolResult(summary: String, failed: Boolean) {
         emit("↳ $summary\n", if (failed) aToolErr else aToolOk, pTool)
         pad(pTool); pad(pGap)
@@ -339,6 +580,7 @@ class ChatView private constructor(private val pane: JTextPane) : JBScrollPane(p
         mode = Mode.NONE; atLineStart = true
         held.setLength(0); fenceInfo.setLength(0); codeLine.setLength(0); buf.setLength(0)
         inFence = false; inline = false; bold = false; pendingStar = false; highlighter = null
+        regions.clear(); folds.clear(); pending = null
     }
 
     // ---- helpers ----
@@ -349,11 +591,11 @@ class ChatView private constructor(private val pane: JTextPane) : JBScrollPane(p
         scrollToBottom()
     }
 
-    private fun emit(text: String, ch: AttributeSet, p: AttributeSet) {
-        if (text.isEmpty()) return
-        val start = doc.length
-        doc.insertString(start, text, ch)
-        doc.setParagraphAttributes(start, text.length, p, true)
+    private fun emit(text: String, ch: AttributeSet, p: AttributeSet, at: Int = doc.length): Int {
+        if (text.isEmpty()) return at
+        doc.insertString(at, text, ch)
+        doc.setParagraphAttributes(at, text.length, p, true)
+        return at + text.length
     }
 
     private fun pad(p: AttributeSet) = emit("\n", tiny, p)

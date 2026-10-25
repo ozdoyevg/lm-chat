@@ -4,21 +4,19 @@ import com.google.gson.JsonArray
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import com.intellij.openapi.application.ApplicationManager
-import com.intellij.openapi.application.ModalityState
 import com.intellij.openapi.application.ReadAction
 import com.intellij.openapi.command.WriteCommandAction
 import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.roots.ProjectFileIndex
-import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.openapi.vfs.VfsUtil
 import dev.lmchat.api.str
 import java.nio.file.Path
 import java.nio.file.Paths
 
-class ProjectTools(private val project: Project) {
+class ProjectTools(private val project: Project, private val approver: (String) -> Boolean) {
 
     val specs: JsonArray = JsonArray().apply {
         add(spec("get_active_file", "Get path, selected text and full content of the file open in the editor."))
@@ -114,19 +112,12 @@ class ProjectTools(private val project: Project) {
         require(first >= 0) { "old_text not found in $rel" }
         require(current.indexOf(old, first + old.length) < 0) { "old_text occurs more than once; add more context" }
         val updated = current.replaceRange(first, first + old.length, replacement)
-        return applyWrite(rel, updated, "Edit $rel:\n--- old\n${old.take(500)}\n+++ new\n${replacement.take(500)}")
+        return applyWrite(rel, current.replaceRange(first, first + old.length, replacement), "Edit $rel")
     }
 
     private fun applyWrite(rel: String, content: String, summary: String): String {
         val p = resolve(rel)
-        var approved = false
-        ApplicationManager.getApplication().invokeAndWait({
-            approved = Messages.showYesNoDialog(
-                project, "$summary\n\n(${content.length} chars)", "LM Chat: allow file change?",
-                "Allow", "Deny", Messages.getQuestionIcon()
-            ) == Messages.YES
-        }, ModalityState.defaultModalityState())
-        if (!approved) return "The user denied this change."
+        if (!approver(summary)) return "The user denied this change."
 
         val fileName = p.fileName.toString()
         WriteCommandAction.writeCommandAction(project).withName("LM Chat: $rel").run<Throwable> {

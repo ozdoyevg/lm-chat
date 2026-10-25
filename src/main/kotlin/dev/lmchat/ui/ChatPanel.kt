@@ -48,8 +48,11 @@ import javax.swing.JButton
 import javax.swing.JComponent
 import javax.swing.JPanel
 import javax.swing.Timer
+import javax.swing.BorderFactory
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.TimeUnit
 
-private const val MAX_ROUNDS = 10
+private const val MAX_ROUNDS = 20
 
 class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
     override fun createToolWindowContent(project: Project, toolWindow: ToolWindow) {
@@ -72,7 +75,7 @@ class StopButton(private val onStop: () -> Unit) : JComponent() {
     private val timer = Timer(30) { angle = (angle + 12) % 360; repaint() }
 
     init {
-        val d = Dimension(JBUI.scale(28), JBUI.scale(28))
+        val d = Dimension(JBUI.scale(30), JBUI.scale(30))
         preferredSize = d
         minimumSize = d
         toolTipText = "Stop"
@@ -98,9 +101,9 @@ class StopButton(private val onStop: () -> Unit) : JComponent() {
             val cx = width / 2
             val cy = height / 2
             icon.paintIcon(this, g2, cx - icon.iconWidth / 2, cy - icon.iconHeight / 2)
-            val r = minOf(width, height) / 2 - JBUI.scale(2)
+            val r = minOf(width, height) / 2 - JBUI.scale(3)
             g2.color = JBColor(Color(0x3574F0), Color(0x548AF7))
-            g2.stroke = BasicStroke(JBUI.scale(2).toFloat(), BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND)
+            g2.stroke = BasicStroke(JBUI.scale(3).toFloat(), BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND)
             g2.drawArc(cx - r, cy - r, 2 * r, 2 * r, angle, 100)
         } finally {
             g2.dispose()
@@ -111,12 +114,19 @@ class StopButton(private val onStop: () -> Unit) : JComponent() {
 class ChatPanel(project: Project) : JPanel(BorderLayout()), Disposable {
 
     private val settings get() = LmSettings.get().state
-    private val tools = ProjectTools(project)
+    private val tools = ProjectTools(project) { askApproval(it) }
     private val history = mutableListOf<JsonObject>()
 
     private val modelBox = ComboBox<ModelItem>()
     private val view = ChatView()
-    private val input = JBTextArea(3, 20).apply { lineWrap = true; wrapStyleWord = true }
+    private val input = JBTextArea(3, 20).apply {
+        lineWrap = true
+        wrapStyleWord = true
+        border = JBUI.Borders.empty(6, 8)
+    }
+    private val inputScroll = JBScrollPane(input).apply {
+        border = JBUI.Borders.customLine(JBColor.border(), 1)
+    }
 
     private val sendBtn = JButton(IconLoader.getIcon("/icons/send.svg", ChatPanel::class.java)).apply {
         toolTipText = "Send (Enter)"
@@ -124,12 +134,15 @@ class ChatPanel(project: Project) : JPanel(BorderLayout()), Disposable {
         isContentAreaFilled = false
         isFocusable = false
         cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
-        val d = Dimension(JBUI.scale(28), JBUI.scale(28))
+        val d = Dimension(JBUI.scale(30), JBUI.scale(30))
         preferredSize = d
         minimumSize = d
     }
     private val stopBtn = StopButton { stop() }
-    private val actionHolder = JPanel(CardLayout()).apply { add(sendBtn, "send"); add(stopBtn, "stop") }
+    private val actionHolder = JPanel(CardLayout()).apply {
+        add(sendBtn, "send")
+        add(stopBtn, "stop")
+    }
 
     @Volatile
     private var client: OpenAiClient? = null
@@ -153,20 +166,29 @@ class ChatPanel(project: Project) : JPanel(BorderLayout()), Disposable {
             true
         ).apply {
             targetComponent = this@ChatPanel
+            setReservePlaceAutoPopupIcon(false)    // removes the empty space reserved for the "»" overflow icon
             component.border = JBUI.Borders.empty()
         }
 
+        // top panel with a line underneath
         add(JPanel(BorderLayout(4, 0)).apply {
-            border = JBUI.Borders.empty(4)
+            border = BorderFactory.createCompoundBorder(
+                JBUI.Borders.customLine(JBColor.border(), 0, 0, 1, 0),
+                JBUI.Borders.empty(4, 6, 4, 2)
+            )
             add(modelBox, BorderLayout.CENTER)
             add(toolbar.component, BorderLayout.EAST)
         }, BorderLayout.NORTH)
 
         add(view, BorderLayout.CENTER)
 
-        add(JPanel(BorderLayout(4, 0)).apply {
-            border = JBUI.Borders.empty(4)
-            add(JBScrollPane(input), BorderLayout.CENTER)
+        // bottom panel with a line above it
+        add(JPanel(BorderLayout(6, 0)).apply {
+            border = BorderFactory.createCompoundBorder(
+                JBUI.Borders.customLine(JBColor.border(), 1, 0, 0, 0),
+                JBUI.Borders.empty(8)
+            )
+            add(inputScroll, BorderLayout.CENTER)
             add(JPanel(BorderLayout()).apply { add(actionHolder, BorderLayout.SOUTH) }, BorderLayout.EAST)
         }, BorderLayout.SOUTH)
 
@@ -210,7 +232,25 @@ class ChatPanel(project: Project) : JPanel(BorderLayout()), Disposable {
     }
 
     private fun stop() {
-        stopRequested = true; client?.cancel()
+        stopRequested = true
+        client?.cancel()
+        view.denyPending()
+    }
+
+    /** Called on the worker thread by the tools; shows Allow/Deny in the chat and waits for the click. */
+    private fun askApproval(summary: String): Boolean {
+        val answer = CompletableFuture<Boolean>()
+        ui { view.requestApproval(summary) { ok -> answer.complete(ok) } }
+        return try {
+            answer.get(15, TimeUnit.MINUTES)
+        } catch (e: Exception) {
+            ui { view.denyPending() }
+            false
+        }
+    }
+
+    override fun dispose() {
+        client?.cancel(); view.denyPending()
     }
 
     // ---- models ----
@@ -325,7 +365,7 @@ class ChatPanel(project: Project) : JPanel(BorderLayout()), Disposable {
             if (res.toolCalls.isEmpty()) return
 
             for (tc in res.toolCalls) {
-                ui { view.toolCall(tc.name, formatArgs(tc.arguments)) }
+                ui { view.toolCall(tc.name, tc.arguments) }
                 val out = tools.execute(tc.name, tc.arguments)
                 history.add(toolMessage(tc.id, out))
                 val failed = out.startsWith("Error") || out.startsWith("The user denied")
@@ -334,10 +374,6 @@ class ChatPanel(project: Project) : JPanel(BorderLayout()), Disposable {
             }
         }
         ui { view.info("Stopped: too many tool rounds.") }
-    }
-
-    override fun dispose() {
-        client?.cancel()
     }
 }
 
