@@ -22,4 +22,7 @@ tasks {
     withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile> { kotlinOptions.jvmTarget = "11" }
     patchPluginXml { sinceBuild.set("221"); untilBuild.set("221.*") }
     buildSearchableOptions { enabled = false }
+    runIde {
+        jvmArgs("-Dlmchat.demo=true")
+    }
 }
