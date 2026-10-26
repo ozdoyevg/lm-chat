@@ -8,6 +8,9 @@
 #gradle -v                # should say 7.6.4
 
 #gradle wrapper
-./gradlew buildPlugin     # → build/distributions/lm-chat-0.1.0.zip
+#./gradlew buildPlugin     # → build/distributions/lm-chat-0.1.0.zip
 #./gradlew runIde          # optional: sandbox IDE (downloads IC 2022.1.3)
 #./gradlew prepareSandbox --continuous
+
+./gradlew :plugin:buildPlugin
+#./gradlew :plugin:runIde
